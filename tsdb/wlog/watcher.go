@@ -83,6 +83,7 @@ type WatcherMetrics struct {
 	recordDecodeFails     *prometheus.CounterVec
 	samplesSentPreTailing *prometheus.CounterVec
 	currentSegment        *prometheus.GaugeVec
+	replaying             *prometheus.GaugeVec
 	notificationsSkipped  *prometheus.CounterVec
 }
 
@@ -108,6 +109,7 @@ type Watcher struct {
 	recordDecodeFailsMetric prometheus.Counter
 	samplesSentPreTailing   prometheus.Counter
 	currentSegmentMetric    prometheus.Gauge
+	replayingMetric         prometheus.Gauge
 	notificationsSkipped    prometheus.Counter
 
 	readNotify chan struct{}
@@ -157,6 +159,15 @@ func NewWatcherMetrics(reg prometheus.Registerer) *WatcherMetrics {
 			},
 			[]string{consumer},
 		),
+		replaying: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Namespace: "prometheus",
+				Subsystem: "wal_watcher",
+				Name:      "replaying",
+				Help:      "Whether the WAL watcher is replaying existing WAL segments (1) or has caught up and is tailing new writes (0).",
+			},
+			[]string{consumer},
+		),
 		notificationsSkipped: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Namespace: "prometheus",
@@ -173,6 +184,7 @@ func NewWatcherMetrics(reg prometheus.Registerer) *WatcherMetrics {
 		reg.MustRegister(m.recordDecodeFails)
 		reg.MustRegister(m.samplesSentPreTailing)
 		reg.MustRegister(m.currentSegment)
+		reg.MustRegister(m.replaying)
 		reg.MustRegister(m.notificationsSkipped)
 	}
 
@@ -189,6 +201,7 @@ func (m *WatcherMetrics) Unregister() {
 	m.reg.Unregister(m.recordDecodeFails)
 	m.reg.Unregister(m.samplesSentPreTailing)
 	m.reg.Unregister(m.currentSegment)
+	m.reg.Unregister(m.replaying)
 	m.reg.Unregister(m.notificationsSkipped)
 }
 
@@ -249,6 +262,7 @@ func (w *Watcher) SetMetrics() {
 		w.recordDecodeFailsMetric = w.metrics.recordDecodeFails.WithLabelValues(w.name)
 		w.samplesSentPreTailing = w.metrics.samplesSentPreTailing.WithLabelValues(w.name)
 		w.currentSegmentMetric = w.metrics.currentSegment.WithLabelValues(w.name)
+		w.replayingMetric = w.metrics.replaying.WithLabelValues(w.name)
 		w.notificationsSkipped = w.metrics.notificationsSkipped.WithLabelValues(w.name)
 	}
 }
@@ -273,6 +287,7 @@ func (w *Watcher) Stop() {
 		w.metrics.recordDecodeFails.DeleteLabelValues(w.name)
 		w.metrics.samplesSentPreTailing.DeleteLabelValues(w.name)
 		w.metrics.currentSegment.DeleteLabelValues(w.name)
+		w.metrics.replaying.DeleteLabelValues(w.name)
 	}
 
 	w.logger.Info("WAL watcher stopped", "queue", w.name)
@@ -309,6 +324,7 @@ func (w *Watcher) Run() error {
 	w.sendSamples = false
 
 	w.logger.Info("Replaying WAL", "queue", w.name)
+	w.replayingMetric.Set(1)
 
 	// Backfill from the checkpoint first if it exists.
 	lastCheckpoint, checkpointIndex, err := LastCheckpoint(w.walDir)
@@ -339,6 +355,13 @@ func (w *Watcher) Run() error {
 	w.logger.Debug("Tailing WAL", "lastCheckpoint", lastCheckpoint, "checkpointIndex", checkpointIndex, "currentSegment", currentSegment, "lastSegment", lastSegment)
 	for !isClosed(w.quit) {
 		w.currentSegmentMetric.Set(float64(currentSegment))
+		// Segments before the last one are existing WAL being replayed; once
+		// the watcher reaches the last segment it is tailing new writes.
+		if currentSegment < lastSegment {
+			w.replayingMetric.Set(1)
+		} else {
+			w.replayingMetric.Set(0)
+		}
 
 		// On start, after reading the existing WAL for series records, we have a pointer to what is the latest segment.
 		// On subsequent calls to this function, currentSegment will have been incremented and we should open that segment.

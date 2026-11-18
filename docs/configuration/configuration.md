@@ -4336,6 +4336,46 @@ metadata_config:
 [ <http_config> ]
 ```
 
+#### Retry and durability semantics
+
+Each `remote_write` config runs its own queue, which is fed by a WAL watcher
+reading the TSDB WAL. Samples that have not been sent yet therefore survive
+restarts: on startup the watcher replays the WAL from the last checkpoint and
+re-enqueues everything the remote endpoint has not acknowledged. Remote write
+is at-least-once, so the remote endpoint must tolerate duplicate samples.
+
+Failed sends are retried indefinitely with exponential backoff between
+`min_backoff` and `max_backoff` as long as the error is recoverable (network
+errors, 5xx responses, and 429 responses when `retry_on_http_429` is set).
+Batches are only dropped on non-recoverable errors (e.g. 4xx responses), when
+samples are older than `sample_age_limit`, or when they are filtered out by
+`write_relabel_configs`. Data can also be lost if the WAL is truncated while
+the remote endpoint has been unreachable for longer than the WAL is retained.
+
+#### Monitoring remote write queues
+
+All queue metrics carry `remote_name` and `url` labels identifying the queue,
+for example:
+
+* `prometheus_remote_storage_samples_total`, `prometheus_remote_storage_samples_retried_total`
+  and `prometheus_remote_storage_samples_failed_total` count sent, retried and
+  permanently failed samples per queue.
+* `prometheus_remote_storage_samples_dropped_total{reason=...}` counts samples
+  dropped before sending (e.g. relabeling, `sample_age_limit`).
+* `prometheus_remote_storage_samples_pending` and
+  `prometheus_remote_storage_enqueue_retries_total` show backpressure.
+* `prometheus_remote_storage_queue_highest_sent_timestamp_seconds` compared to
+  `prometheus_remote_storage_queue_highest_timestamp_seconds` shows how far
+  behind the remote endpoint the queue is.
+
+The WAL watchers expose per-queue progress metrics with a `consumer` label:
+
+* `prometheus_wal_watcher_replaying` is 1 while a queue is replaying existing
+  WAL segments after a (re)start or a WAL read error, and 0 once it has caught
+  up and is tailing new writes. A queue stuck at 1 is falling behind.
+* `prometheus_wal_watcher_current_segment` shows which WAL segment the queue
+  is reading.
+
 There is a list of
 [integrations](https://prometheus.io/docs/operating/integrations/#remote-endpoints-and-storage)
 with this feature.

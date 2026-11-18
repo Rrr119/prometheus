@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	client_testutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/prometheus/common/promslog"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
@@ -756,6 +757,69 @@ func TestCheckpointSeriesReset(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestWatcher_ReplayingMetric(t *testing.T) {
+	const pageSize = 32 * 1024
+	const seriesCount = 10
+	const samplesCount = 500
+
+	dir := t.TempDir()
+	wdir := path.Join(dir, "wal")
+	require.NoError(t, os.Mkdir(wdir, 0o777))
+
+	enc := record.Encoder{}
+	w, err := NewSize(nil, nil, wdir, pageSize, compression.None)
+	require.NoError(t, err)
+
+	for i := range seriesCount {
+		series := enc.Series([]record.RefSeries{
+			{
+				Ref:    chunks.HeadSeriesRef(i),
+				Labels: labels.FromStrings("__name__", fmt.Sprintf("metric_%d", i)),
+			},
+		}, nil)
+		require.NoError(t, w.Log(series))
+		for range samplesCount {
+			sample := enc.Samples([]record.RefSample{
+				{
+					Ref: chunks.HeadSeriesRef(i),
+					T:   int64(i),
+					V:   float64(i),
+				},
+			}, nil)
+			require.NoError(t, w.Log(sample))
+		}
+	}
+	require.NoError(t, w.Close())
+
+	_, lastSegment, err := Segments(wdir)
+	require.NoError(t, err)
+	require.Positive(t, lastSegment, "expected the WAL to span multiple segments")
+
+	metrics := NewWatcherMetrics(prometheus.NewRegistry())
+	replaying := func() float64 {
+		return client_testutil.ToFloat64(metrics.replaying.WithLabelValues("test"))
+	}
+
+	wt := newWriteToMock(0)
+	watcher := NewWatcher(metrics, nil, nil, "test", wt, dir, false, false, false, nil)
+
+	// Replay only the first (backlog) segment: the watcher must report that
+	// it is still replaying, as it has not caught up with the live segment.
+	watcher.MaxSegment = 0
+	watcher.SetMetrics()
+	require.NoError(t, watcher.Run())
+	require.Equal(t, 1.0, replaying())
+
+	// Resume watching: once the watcher reaches the live segment it must
+	// report that replay is done and it is tailing new writes.
+	watcher.MaxSegment = -1
+	watcher.Start()
+	require.Eventually(t, func() bool {
+		return replaying() == 0
+	}, 20*time.Second, 100*time.Millisecond)
+	watcher.Stop()
 }
 
 func TestRun_StartupTime(t *testing.T) {
